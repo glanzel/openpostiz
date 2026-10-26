@@ -61,5 +61,9 @@ RUN npm --no-update-notifier --no-fund --global install pnpm@10.6.1 pm2
 WORKDIR /app
 COPY --from=builder /app /app
 COPY var/docker/nginx.conf /etc/nginx/nginx.conf
+COPY var/docker/ecosystem.config.cjs /app/ecosystem.config.cjs
+COPY var/docker/slim-entrypoint.sh /usr/local/bin/slim-entrypoint.sh
+RUN chmod +x /usr/local/bin/slim-entrypoint.sh
 
-CMD ["sh", "-c", "nginx && pnpm run pm2"]
+# Schlanker Start: prisma db push -> pm2-runtime (3 Apps direkt, ohne pnpm-Wrapper)
+CMD ["/usr/local/bin/slim-entrypoint.sh"]

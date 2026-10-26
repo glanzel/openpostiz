@@ -1,0 +1,64 @@
+--- 
+name: "Build Slim Container"
+
+# Baut das Multi-Stage "slim"-Image (Dockerfile.slim) für amd64 + arm64
+# und pusht es als ghcr.io/<owner>/<repo>:slim
+# Manuell starten: Actions -> "Build Slim Container" -> Run workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push (arch)
+        env:
+          NEXT_PUBLIC_VERSION: slim
+        run: |
+          docker buildx build --platform linux/${{ matrix.arch }} \
+            -f Dockerfile.slim \
+            -t ghcr.io/${{ github.repository }}:slim-${{ matrix.arch }} \
+            --build-arg NEXT_PUBLIC_VERSION=${{ env.NEXT_PUBLIC_VERSION }} \
+            --provenance=false --sbom=false \
+            --output "type=registry,name=ghcr.io/${{ github.repository }}:slim-${{ matrix.arch }}" .
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create and push manifest (:slim)
+        run: |
+          docker manifest create ghcr.io/${{ github.repository }}:slim \
+            --amend ghcr.io/${{ github.repository }}:slim-amd64 \
+            --amend ghcr.io/${{ github.repository }}:slim-arm64
+          docker manifest push ghcr.io/${{ github.repository }}:slim

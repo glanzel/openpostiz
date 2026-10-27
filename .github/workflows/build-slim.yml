@@ -7,6 +7,20 @@ name: "Build Slim Container"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feat/slim-image
+      - feat/lazy-loading
+    paths:
+      - 'Dockerfile.slim'
+      - 'var/docker/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/build-slim.yml'
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   build:

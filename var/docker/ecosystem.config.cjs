@@ -17,6 +17,10 @@ module.exports = {
       interpreter: 'node',
       node_args: '--experimental-require-module',
       env: { NODE_ENV: 'production' },
+      // Der Watchdog (TEMPORAL_WORKER_WATCHDOG=1) beendet den Prozess, wenn
+      // kein Temporal-Worker laeuft. PM2 startet ihn dann neu (mit Backoff).
+      restart_delay: 5000,
+      exp_backoff_restart_delay: 100,
     },
     {
       name: 'frontend',

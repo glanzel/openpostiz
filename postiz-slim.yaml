@@ -1,0 +1,323 @@
+# ============================================================
+#  Postiz – Self-Hosted mit Slim-Image (Multi-Stage, vorgebaut)
+#  und OHNE Elasticsearch (Temporal mit PostgreSQL-Visibility).
+#
+#  Image: ghcr.io/glanzel/openpostiz:slim
+#
+#  Vor dem Start anpassen:
+#   - MAIN_URL / FRONTEND_URL / NEXT_PUBLIC_BACKEND_URL
+#   - JWT_SECRET (lang + zufällig)
+#   - postiz-postgres: POSTGRES_USER/PASSWORD/DB + DATABASE_URL
+#   - ggf. Social-Media-/Storage-Keys
+#
+#  Start:  docker compose -f postiz-slim.yaml up -d
+#
+#  Hinweis: "dynamicconfig/" muss neben dieser Datei liegen
+#  (aus dem postiz-docker-compose-Repo).
+#
+#  Bestehende Daten übernehmen (Coolify/Docker):
+#  Docker Compose präfixt benannte Volumes mit dem Projektnamen. Sollen die
+#  vorhandenen Volumes genutzt werden, im volumes:-Block jeweils
+#    <name>:
+#      external: true
+#      name: <exakter-volume-name-vom-server>
+#  setzen. Namen ermitteln:
+#    docker inspect postiz-postgres --format '{{range .Mounts}}{{.Name}} {{.Destination}}{{"\n"}}{{end}}'
+# ============================================================
+
+services:
+  postiz:
+    image: ghcr.io/glanzel/openpostiz:slim
+    container_name: postiz
+    restart: always
+    environment:
+      # === Required Settings (BITTE ANPASSEN) ===
+      MAIN_URL: 'https://postiz.example.com'
+      FRONTEND_URL: 'https://postiz.example.com'
+      NEXT_PUBLIC_BACKEND_URL: 'https://postiz.example.com/api'
+      JWT_SECRET: 'change-me-to-a-long-random-string'
+      DATABASE_URL: 'postgresql://postiz-user:postiz-password@postiz-postgres:5432/postiz-db-local'
+      REDIS_URL: 'redis://postiz-redis:6379'
+      BACKEND_INTERNAL_URL: 'http://localhost:3000'
+      TEMPORAL_ADDRESS: "temporal:7233"
+      # Selbstheilung: Orchestrator beendet sich, wenn kein Temporal-Worker
+      # laeuft; pm2-runtime startet ihn neu (Supervisor vorhanden).
+      TEMPORAL_WORKER_WATCHDOG: '1'
+      IS_GENERAL: 'true'
+      DISABLE_REGISTRATION: 'false'
+      RUN_CRON: 'true'
+
+      # === Storage Settings
+      STORAGE_PROVIDER: 'local'
+      UPLOAD_DIRECTORY: '/uploads'
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: '/uploads'
+
+      # === Cloudflare (R2) Settings (optional)
+      # STORAGE_PROVIDER: 'cloudflare'
+      # CLOUDFLARE_ACCOUNT_ID: ''
+      # CLOUDFLARE_ACCESS_KEY: ''
+      # CLOUDFLARE_SECRET_ACCESS_KEY: ''
+      # CLOUDFLARE_BUCKETNAME: ''
+      # CLOUDFLARE_BUCKET_URL: ''
+      # CLOUDFLARE_REGION: 'auto'
+
+      # === Social Media API Settings (leer = nicht konfiguriert)
+      X_API_KEY: ''
+      X_API_SECRET: ''
+      LINKEDIN_CLIENT_ID: ''
+      LINKEDIN_CLIENT_SECRET: ''
+      REDDIT_CLIENT_ID: ''
+      REDDIT_CLIENT_SECRET: ''
+      GITHUB_CLIENT_ID: ''
+      GITHUB_CLIENT_SECRET: ''
+      BEEHIIVE_API_KEY: ''
+      BEEHIIVE_PUBLICATION_ID: ''
+      THREADS_APP_ID: ''
+      THREADS_APP_SECRET: ''
+      FACEBOOK_APP_ID: ''
+      FACEBOOK_APP_SECRET: ''
+      YOUTUBE_CLIENT_ID: ''
+      YOUTUBE_CLIENT_SECRET: ''
+      TIKTOK_CLIENT_ID: ''
+      TIKTOK_CLIENT_SECRET: ''
+      PINTEREST_CLIENT_ID: ''
+      PINTEREST_CLIENT_SECRET: ''
+      DRIBBBLE_CLIENT_ID: ''
+      DRIBBBLE_CLIENT_SECRET: ''
+      DISCORD_CLIENT_ID: ''
+      DISCORD_CLIENT_SECRET: ''
+      DISCORD_BOT_TOKEN_ID: ''
+      SLACK_ID: ''
+      SLACK_SECRET: ''
+      SLACK_SIGNING_SECRET: ''
+      MASTODON_URL: 'https://mastodon.social'
+      MASTODON_CLIENT_ID: ''
+      MASTODON_CLIENT_SECRET: ''
+
+      # === OAuth / Authentik (optional)
+      # NEXT_PUBLIC_POSTIZ_OAUTH_DISPLAY_NAME: ''
+      # NEXT_PUBLIC_POSTIZ_OAUTH_LOGO_URL: ''
+      # POSTIZ_GENERIC_OAUTH: 'false'
+      # POSTIZ_OAUTH_URL: ''
+      # POSTIZ_OAUTH_AUTH_URL: ''
+      # POSTIZ_OAUTH_TOKEN_URL: ''
+      # POSTIZ_OAUTH_USERINFO_URL: ''
+      # POSTIZ_OAUTH_CLIENT_ID: ''
+      # POSTIZ_OAUTH_CLIENT_SECRET: ''
+      # POSTIZ_OAUTH_SCOPE: "openid profile email"
+
+      # === Misc Settings
+      OPENAI_API_KEY: ''
+      NEXT_PUBLIC_DISCORD_SUPPORT: ''
+      NEXT_PUBLIC_POLOTNO: ''
+      API_LIMIT: 30
+
+      # === Payment / Stripe Settings
+      FEE_AMOUNT: 0.05
+      STRIPE_PUBLISHABLE_KEY: ''
+      STRIPE_SECRET_KEY: ''
+      STRIPE_SIGNING_KEY: ''
+      STRIPE_SIGNING_KEY_CONNECT: ''
+
+      # === Developer Settings
+      NX_ADD_PLUGINS: false
+
+    volumes:
+      - postiz-config:/config/
+      - postiz-uploads:/uploads/
+    ports:
+      - "4007:5000"
+    networks:
+      - postiz-network
+      - temporal-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "const r=require('http').get('http://localhost:5000/',res=>process.exit(res.statusCode<500?0:1));r.on('error',()=>process.exit(1));r.setTimeout(4000,()=>{r.destroy();process.exit(1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    depends_on:
+      postiz-postgres:
+        condition: service_healthy
+      postiz-redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      temporal-visibility-init:
+        condition: service_completed_successfully
+
+  postiz-postgres:
+    image: postgres:17-alpine
+    container_name: postiz-postgres
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: postiz-password
+      POSTGRES_USER: postiz-user
+      POSTGRES_DB: postiz-db-local
+    volumes:
+      - postgres-volume:/var/lib/postgresql/data
+    networks:
+      - postiz-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postiz-user -d postiz-db-local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  postiz-redis:
+    image: redis:7.2
+    container_name: postiz-redis
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - postiz-redis-data:/data
+    networks:
+      - postiz-network
+
+  # Optional: nur mit "--profile debug" starten
+  spotlight:
+    profiles: [debug]
+    pull_policy: always
+    container_name: spotlight
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8969:8969/tcp
+    image: ghcr.io/getsentry/spotlight:latest
+    networks:
+      - postiz-network
+
+  # -----------------------
+  # Temporal Stack (OHNE Elasticsearch -> PostgreSQL-Visibility)
+  # -----------------------
+  temporal-postgresql:
+    container_name: temporal-postgresql
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_USER: temporal
+    networks:
+      - temporal-network
+    expose:
+      - 5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - temporal-postgres-data:/var/lib/postgresql/data
+
+  temporal:
+    container_name: temporal
+    restart: always
+    ports:
+      - '127.0.0.1:7233:7233'
+    image: temporalio/auto-setup:1.28.1
+    depends_on:
+      temporal-postgresql:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-postgresql
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      - TEMPORAL_NAMESPACE=default
+    networks:
+      - temporal-network
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig
+    labels:
+      kompose.volume.type: configMap
+
+  # Einmaliger Init: entfernt die zwei Default-Text-Search-Attribute
+  # (CustomStringField, CustomTextField), damit Postiz' zwei Text-Attribute
+  # ins Standard-Visibility-Limit von 3 passen. Endet mit "Exited (0)".
+  temporal-visibility-init:
+    container_name: temporal-visibility-init
+    image: temporalio/admin-tools:1.28.1-tctl-1.18.4-cli-1.4.1
+    restart: "no"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    networks:
+      - temporal-network
+    entrypoint:
+      - sh
+      - -c
+      - |
+        for a in CustomStringField CustomTextField; do
+          printf "Y\n" | tctl --address temporal:7233 admin cluster remove-search-attributes --name "$$a" >/dev/null 2>&1 || true
+          echo "entfernt (falls vorhanden): $$a"
+        done
+        echo "visibility-init fertig"
+
+  temporal-admin-tools:
+    container_name: temporal-admin-tools
+    image: temporalio/admin-tools:1.28.1-tctl-1.18.4-cli-1.4.1
+    restart: on-failure
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CLI_ADDRESS=temporal:7233
+    networks:
+      - temporal-network
+    stdin_open: true
+    depends_on:
+      temporal:
+        condition: service_healthy
+    tty: true
+
+  temporal-ui:
+    container_name: temporal-ui
+    image: temporalio/ui:2.34.0
+    restart: always
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://127.0.0.1:3000
+    networks:
+      - temporal-network
+    ports:
+      - '127.0.0.1:8080:8080'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+volumes:
+  postgres-volume:
+    external: false
+  postiz-redis-data:
+    external: false
+  postiz-config:
+    external: false
+  postiz-uploads:
+    external: false
+  temporal-postgres-data:
+    external: false
+
+networks:
+  postiz-network:
+    external: false
+  temporal-network:
+    driver: bridge
+    name: temporal-network

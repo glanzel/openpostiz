@@ -1,0 +1,118 @@
+---
+name: "Auto-rebase onto upstream"
+
+# Muss auf dem Default-Branch (main) liegen, damit schedule/workflow_dispatch laufen.
+# Rebased main auf upstream/main. Vorher wird immer ein Backup-Branch gepusht.
+# Bei Konflikt übernimmt ein OpenCode-Agent die Auflösung (siehe Prompt-Datei).
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # täglich 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  BRANCH: main
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+    steps:
+      - name: Checkout main (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/gitroomhq/postiz-app.git
+          git fetch upstream main
+
+      - name: Check if already up to date
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Backup current state
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          STAMP=$(date +%Y%m%d-%H%M%S)
+          git branch -f backup/main HEAD
+          git push --force origin backup/main
+          git branch -f "backup/main-${STAMP}" HEAD
+          git push origin "backup/main-${STAMP}"
+
+      - name: Rebase onto upstream/main
+        if: steps.check.outputs.up_to_date == 'false'
+        id: rebase
+        continue-on-error: true
+        run: git rebase upstream/main
+
+      - name: Resolve conflicts with OpenCode
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outcome == 'failure'
+        id: agent
+        continue-on-error: true
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GIT_EDITOR: 'true'
+        run: |
+          if [ -z "$OPENCODE_MODEL" ]; then
+            echo "::error::Repository variable OPENCODE_MODEL is not set (e.g. anthropic/claude-sonnet-5-5)"
+            exit 1
+          fi
+          curl -fsSL https://opencode.ai/install | bash
+          export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+          command -v opencode
+          opencode --version
+          opencode run --model "$OPENCODE_MODEL" "$(cat .github/auto-rebase-prompt.md)"
+
+      - name: Verify rebase finished
+        if: steps.check.outputs.up_to_date == 'false' && (steps.rebase.outcome == 'success' || steps.agent.outcome == 'success')
+        run: |
+          if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+            echo "::error::Rebase is still in progress"
+            exit 1
+          fi
+          docker compose -f postiz-slim.yaml config -q
+
+      - name: Push rebased main
+        if: steps.check.outputs.up_to_date == 'false' && (steps.rebase.outcome == 'success' || steps.agent.outcome == 'success')
+        run: git push --force-with-lease origin "HEAD:${BRANCH}"
+
+      - name: Abort and report failure
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outcome == 'failure' && steps.agent.outcome != 'success'
+        run: |
+          CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+          git rebase --abort || true
+          BODY=$(cat <<EOF
+          Auto-rebase of \`main\` onto \`upstream/main\` failed and the OpenCode agent could not resolve it.
+
+          Backup branch: \`backup/main\`
+
+          Conflicted files: \`${CONFLICTS}\`
+
+          See \`FORK.md\` and \`.github/auto-rebase-prompt.md\`.
+          EOF
+          )
+          gh issue create --title "Auto-rebase failed on main" --body "$BODY" || true
+          exit 1

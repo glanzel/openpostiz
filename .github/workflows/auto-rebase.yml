@@ -1,0 +1,188 @@
+---
+name: "Auto-rebase onto upstream"
+
+# Muss auf dem Default-Branch (main) liegen, damit schedule/workflow_dispatch laufen.
+#
+# Grundsatz: Der Rebase ändert NIE Dateien unter .github/workflows/. Nach dem
+# Rebase werden sie auf den Stand von backup/main zurückgesetzt ("gepinnt").
+# Dadurch kann der normale GITHUB_TOKEN pushen (kein PAT nötig).
+#
+# Voraussetzung: Der rollierende Branch `backup/main` existiert bereits.
+# Einmalig anlegen:  git push origin main:backup/main
+
+on:
+  schedule:
+    - cron: '0 4 * * 0,2-6' # So + Di–Sa: Rebase automatisch
+    - cron: '30 4 * * 1'    # Mo: Rebase mit OpenCode-Agent
+  workflow_dispatch:
+    inputs:
+      allow_agent:
+        description: 'Allow OpenCode to resolve conflicts'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  BRANCH: main
+  BACKUP_BRANCH: backup/main
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/gitroomhq/postiz-app.git
+          git fetch upstream main
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event.schedule }}" = "30 4 * * 1" ] || [ "${{ inputs.allow_agent }}" = "true" ]; then
+            echo "allow_agent=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allow_agent=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if already up to date
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure rolling backup branch exists
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          if ! git ls-remote --exit-code --heads origin "${BACKUP_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Branch ${BACKUP_BRANCH} is missing. Create it once: git push origin main:${BACKUP_BRANCH}"
+            exit 1
+          fi
+
+      - name: Update rolling backup
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          git branch -f "${BACKUP_BRANCH}" HEAD
+          git push --force origin "${BACKUP_BRANCH}"
+
+      - name: Rebase onto upstream/main
+        if: steps.check.outputs.up_to_date == 'false'
+        id: rebase
+        continue-on-error: true
+        run: git rebase upstream/main
+
+      - name: Resolve conflicts with OpenCode
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outcome == 'failure' && steps.mode.outputs.allow_agent == 'true'
+        id: agent
+        continue-on-error: true
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GIT_EDITOR: 'true'
+        run: |
+          if [ -z "$OPENCODE_MODEL" ]; then
+            echo "::error::Repository variable OPENCODE_MODEL is not set (e.g. anthropic/claude-sonnet-5-5)"
+            exit 1
+          fi
+          curl -fsSL https://opencode.ai/install | bash
+          export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+          command -v opencode
+          opencode --version
+          opencode run --model "$OPENCODE_MODEL" "$(cat .github/auto-rebase-prompt.md)"
+
+      - name: Defer conflict (agent disabled)
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outcome == 'failure' && steps.mode.outputs.allow_agent == 'false'
+        run: |
+          CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+          git rebase --abort || true
+          BODY=$(cat <<EOF
+          Auto-rebase of \`main\` onto \`upstream/main\` hit a conflict and the agent was disabled.
+
+          Backup branch: \`${BACKUP_BRANCH}\`
+
+          Conflicted files: \`${CONFLICTS}\`
+
+          Re-run this workflow manually with \`allow_agent=true\`.
+          EOF
+          )
+          NUM=$(gh issue list --state open --search "Auto-rebase conflict on main in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --body "$BODY"
+          else
+            gh issue create --title "Auto-rebase conflict on main" --body "$BODY"
+          fi
+
+      - name: Verify rebase finished
+        if: steps.check.outputs.up_to_date == 'false' && (steps.rebase.outcome == 'success' || steps.agent.outcome == 'success')
+        run: |
+          if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+            echo "::error::Rebase is still in progress"
+            exit 1
+          fi
+
+      - name: Pin workflows to pre-rebase state
+        if: steps.check.outputs.up_to_date == 'false' && (steps.rebase.outcome == 'success' || steps.agent.outcome == 'success')
+        env:
+          GIT_EDITOR: 'true'
+        run: |
+          rm -rf .github/workflows
+          git checkout "${BACKUP_BRANCH}" -- .github/workflows
+          git add -A .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
+
+      - name: Verify invariants (before push)
+        if: steps.check.outputs.up_to_date == 'false' && (steps.rebase.outcome == 'success' || steps.agent.outcome == 'success')
+        run: |
+          # package.json / lockfile must be identical to upstream
+          git diff --exit-code upstream/main -- package.json pnpm-lock.yaml
+          # compose must be valid
+          docker compose -f postiz-slim.yaml config -q
+          # intentional files must exist
+          test -f Dockerfile.slim
+          test -f var/docker/slim-entrypoint.sh
+          test -f postiz-slim.yaml
+          grep -q "TEMPORAL_WORKER_WATCHDOG" postiz-slim.yaml
+
+      - name: Push rebased main
+        if: steps.check.outputs.up_to_date == 'false' && (steps.rebase.outcome == 'success' || steps.agent.outcome == 'success')
+        run: git push --force-with-lease origin "HEAD:${BRANCH}"
+
+      - name: Report agent failure
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outcome == 'failure' && steps.agent.outcome == 'failure'
+        run: |
+          CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+          git rebase --abort || true
+          BODY=$(cat <<EOF
+          Auto-rebase of \`main\` onto \`upstream/main\` failed and the OpenCode agent could not resolve it.
+
+          Backup branch: \`${BACKUP_BRANCH}\`
+
+          Conflicted files: \`${CONFLICTS}\`
+
+          See \`FORK.md\` and \`.github/auto-rebase-prompt.md\`.
+          EOF
+          )
+          gh issue create --title "Auto-rebase failed on main" --body "$BODY" || true
+          exit 1

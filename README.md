@@ -1,3 +1,12 @@
+> [!NOTE]
+> **Fork notice:** This is a fork of [gitroomhq/postiz-app](https://github.com/gitroomhq/postiz-app)
+> for **slim self-hosting**. It ships a multi-stage image
+> (`ghcr.io/glanzel/openpostiz:slim`), runs **without Elasticsearch**, and includes a
+> ready-to-use compose file (`postiz-slim.yaml`).
+> See [`FORK.md`](./FORK.md) for the intentional changes, invariants and maintenance rules.
+
+---
+
 <p align="center">
   <a href="https://postiz.com/" target="_blank">
   <picture>

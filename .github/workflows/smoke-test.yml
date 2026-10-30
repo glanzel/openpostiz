@@ -1,0 +1,85 @@
+---
+name: "Smoke Test"
+
+# Läuft nach jedem erfolgreichen Slim-Image-Build (workflow_run) und manuell.
+# Zieht das fertige Image aus GHCR (kein Build) und prüft:
+#   - Stack startet (Postgres, Redis, Temporal, Postiz; ohne ES)
+#   - /api/ -> 200
+#   - Register -> Login -> /api/user/self
+
+on:
+  workflow_run:
+    workflows: ["Build Slim Container"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  smoke:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Compose override (localhost + published image)
+        run: |
+          REPO=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          cat > smoke-override.yaml <<EOF
+          services:
+            postiz:
+              image: ghcr.io/${REPO}:slim
+              environment:
+                MAIN_URL: http://localhost:4007
+                FRONTEND_URL: http://localhost:4007
+                NEXT_PUBLIC_BACKEND_URL: http://localhost:4007/api
+                JWT_SECRET: smoke-test-secret-123456
+                NOT_SECURED: 'true'
+          EOF
+
+      - name: Start stack
+        run: docker compose -f postiz-slim.yaml -f smoke-override.yaml up -d
+
+      - name: Wait for /api/
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4007/api/ || true)
+            echo "attempt $i: $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "::error::API did not become ready"
+          exit 1
+
+      - name: Register, login, authenticated request
+        run: |
+          set -e
+          curl -fsS -X POST http://localhost:4007/api/auth/register \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"smoke@example.com","password":"smoke-test","provider":"LOCAL","company":"Smoke","datafast_visitor_id":""}' \
+            -c cookies.txt
+          curl -fsS -X POST http://localhost:4007/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"smoke@example.com","password":"smoke-test","provider":"LOCAL"}' \
+            -c login.txt
+          curl -fsS -b login.txt http://localhost:4007/api/user/self | grep -q '"email":"smoke@example.com"'
+          echo "auth flow OK"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f postiz-slim.yaml -f smoke-override.yaml logs --no-color | tail -200
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f postiz-slim.yaml -f smoke-override.yaml down -v

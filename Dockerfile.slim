@@ -1,54 +1,117 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-#  Postiz – Multi-Stage "slim" Image
+#  OpenPostiz – production image (multi-stage)
 #
-#  Unterschied zu Dockerfile.dev (single-stage):
-#   - Builder-Stage: installiert ALLE Deps und baut die Apps.
-#   - Runtime-Stage: enthält nur noch Prod-Dependencies + Build-Output + nginx.
-#     g++/make/python3-pip (nur zum Bauen nötig) landen NICHT im finalen Image,
-#     Dev-Dependencies werden per `pnpm prune --prod` entfernt.
+#  Dockerfile.dev is the all-in-one dev image: build tools, pnpm and all
+#  dependencies (including devDependencies) stay in the final image.
 #
-#  Ziel: deutlich kleineres Image (~1/2) bei identischem Runtime-Verhalten
-#  (CMD bleibt `nginx && pnpm run pm2`).
+#  This file builds the same application in two stages:
+#    builder  – toolchain + all dependencies + build output
+#    runtime  – only the built app, production dependencies, nginx and pm2
 #
-#  Hinweis: setzt voraus, dass `prisma` in den dependencies liegt und die
-#  prisma-Skripte das lokale Binary nutzen (siehe package.json in diesem Branch).
+#  Build:
+#    docker build -f Dockerfile.slim -t postiz:local .
+#
+#  Or use the compose override (builds from this checkout and runs the lean
+#  self-hosting stack without Elasticsearch):
+#    docker compose -f postiz-slim.yaml -f docker-compose.slim.yaml up -d --build
+#
+#  package.json / pnpm-lock.yaml stay identical to upstream. The prisma CLI
+#  and source-map-support are installed into /opt/runtime-tools so the fork's
+#  upstream sync automation can keep taking the upstream manifests unchanged.
 # =============================================================================
 
-# ---------------------------------------------------------------- Builder ----
-FROM node:22.20-bookworm-slim AS builder
+# ---------------------------------------------------------------- builder ----
+FROM node:22.23.4-bookworm-slim AS builder
 
 ARG NEXT_PUBLIC_VERSION=dev
 ENV NEXT_PUBLIC_VERSION=$NEXT_PUBLIC_VERSION
+ENV NEXT_TELEMETRY_DISABLED=1
 
-# Build-Tools nur hier – nicht im finalen Image.
+# Build tools are only needed in this stage. They never reach the runtime image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      g++ make python3-pip bash ca-certificates \
+      g++ \
+      make \
+      python3-pip \
+      bash \
+      ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 RUN npm --no-update-notifier --no-fund --global install pnpm@10.6.1
 
 WORKDIR /app
+
+# Install dependencies from the lockfile first so that this layer is cached
+# until the manifests change. Only the files that the install lifecycle
+# scripts need are copied alongside the manifests.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY apps/backend/package.json ./apps/backend/
+COPY apps/commands/package.json ./apps/commands/
+COPY apps/extension/package.json ./apps/extension/
+COPY apps/frontend/package.json ./apps/frontend/
+COPY apps/orchestrator/package.json ./apps/orchestrator/
+COPY apps/sdk/package.json ./apps/sdk/
+COPY libraries/nestjs-libraries/src/database/prisma/schema.prisma ./libraries/nestjs-libraries/src/database/prisma/
+COPY apps/frontend/scripts/fetch-gtm.mjs ./apps/frontend/scripts/
+
+RUN --mount=type=cache,id=postiz-pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --store-dir=/pnpm/store
+
+# The runtime image has no devDependencies, so keep a small tool directory for
+# the prisma CLI (db push at container start) and source-map-support (imported
+# by the orchestrator but only available transitively through dev tooling).
+RUN PRISMA_VERSION="$(node -e "const p=require('./package.json'); process.stdout.write((p.dependencies&&p.dependencies.prisma)||(p.devDependencies&&p.devDependencies.prisma)||'')")" \
+ && test -n "$PRISMA_VERSION" \
+ && npm --no-update-notifier --no-fund install \
+      --prefix /opt/runtime-tools \
+      --no-save \
+      --no-package-lock \
+      "prisma@${PRISMA_VERSION}" \
+      "source-map-support@^0.5.21" \
+ && rm -rf /root/.npm
+
 COPY . .
 
-RUN pnpm install --frozen-lockfile
-RUN NODE_OPTIONS="--max-old-space-size=4096" pnpm run build
+# The dependency layer above only contains manifests, so the frontend's
+# postinstall could not fetch the optional GTM script yet. Run it now that the
+# full source tree (and an optional .env) is available.
+RUN pnpm --filter ./apps/frontend run fetch-gtm
 
-# Dev-Dependencies entfernen (cross-env, typescript, nx, ...).
-RUN pnpm prune --prod
-# Prisma-Client im geprunten Baum neu erzeugen, damit die generierte Client-
-# Ausgabe garantiert vorhanden bleibt.
-RUN pnpm run prisma-generate
+RUN --mount=type=cache,id=postiz-next-cache,target=/app/apps/frontend/.next/cache \
+    NODE_OPTIONS="--max-old-space-size=4096" pnpm run build
 
-# ---------------------------------------------------------------- Runtime ----
-FROM node:22.20-bookworm-slim AS runtime
+# Reinstall only production dependencies (typescript, vite, jest, ... are
+# dropped). A clean install is used instead of "pnpm prune", because prune
+# does not reliably remove devDependencies in a hoisted pnpm workspace.
+# The generated Prisma client is preserved across the reinstall; build scripts
+# stay disabled except for bcrypt, which needs its native binding.
+RUN --mount=type=cache,id=postiz-pnpm-store,target=/pnpm/store \
+    cp -a --dereference node_modules/.prisma /tmp/prisma-client \
+ && rm -rf node_modules apps/*/node_modules \
+ && pnpm install --prod --frozen-lockfile --ignore-scripts --store-dir=/pnpm/store \
+ && pnpm rebuild bcrypt \
+ && rm -rf node_modules/.prisma \
+ && cp -a /tmp/prisma-client node_modules/.prisma \
+ && rm -rf \
+      /tmp/prisma-client \
+      apps/frontend/.next/cache \
+      node_modules/.cache \
+      .nx \
+      reports
+
+# ---------------------------------------------------------------- runtime ----
+FROM node:22.23.4-bookworm-slim AS runtime
 
 ARG NEXT_PUBLIC_VERSION=dev
 ENV NEXT_PUBLIC_VERSION=$NEXT_PUBLIC_VERSION
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
 
-# Ohne g++/make/python. Nur was die Laufzeit braucht.
+# Runtime packages only. No compilers, Python, pnpm or devDependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      bash nginx ca-certificates \
+      bash \
+      nginx \
+      ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 RUN addgroup --system www \
@@ -56,14 +119,22 @@ RUN addgroup --system www \
  && mkdir -p /www \
  && chown -R www:www /www /var/lib/nginx
 
-RUN npm --no-update-notifier --no-fund --global install pnpm@10.6.1 pm2
+# pm2 supervises the three node processes (backend, orchestrator, frontend).
+RUN npm --no-update-notifier --no-fund --global install pm2 \
+ && npm cache clean --force
 
 WORKDIR /app
+
 COPY --from=builder /app /app
+COPY --from=builder /opt/runtime-tools /opt/runtime-tools
 COPY var/docker/nginx.conf /etc/nginx/nginx.conf
 COPY var/docker/ecosystem.config.cjs /app/ecosystem.config.cjs
 COPY var/docker/slim-entrypoint.sh /usr/local/bin/slim-entrypoint.sh
-RUN chmod +x /usr/local/bin/slim-entrypoint.sh
+RUN chmod +x /usr/local/bin/slim-entrypoint.sh \
+ && rm -rf /app/node_modules/source-map-support \
+ && ln -s /opt/runtime-tools/node_modules/source-map-support /app/node_modules/source-map-support
 
-# Schlanker Start: prisma db push -> pm2-runtime (3 Apps direkt, ohne pnpm-Wrapper)
+EXPOSE 5000
+
+# nginx on :5000, backend on :3000, frontend on :4200
 CMD ["/usr/local/bin/slim-entrypoint.sh"]

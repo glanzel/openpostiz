@@ -8,20 +8,23 @@ rebases and LLM agents.
 
 | File | Purpose |
 |---|---|
-| `Dockerfile.slim` | Multi-stage build: all deps/build in a builder stage; runtime without g++/make/python and (intended) without dev deps. |
-| `var/docker/slim-entrypoint.sh` | Runs nginx, `prisma db push`, waits for Temporal, then `pm2-runtime`. |
+| `Dockerfile.slim` | Multi-stage build: all deps/build in a builder stage; runtime without compilers, Python, pnpm or dev dependencies. A clean `pnpm install --prod` (not `pnpm prune`) produces the runtime tree. |
+| `var/docker/slim-entrypoint.sh` | Applies the Prisma schema (with retries), waits for Temporal, starts nginx, then `pm2-runtime`. |
 | `var/docker/ecosystem.config.cjs` | Starts backend/frontend/orchestrator directly (no pnpm wrappers). |
 | `apps/orchestrator/src/main.ts` | Opt-in worker watchdog (`TEMPORAL_WORKER_WATCHDOG=1`): exits if no Temporal worker is running so the supervisor restarts it. |
 | `postiz-slim.yaml` | Sanitized self-hosting compose: slim image, no Elasticsearch, `temporal-visibility-init`. |
+| `docker-compose.slim.yaml` | Compose override that builds `Dockerfile.slim` from the checkout. |
 | `.github/workflows/build-slim.yml` | Builds `ghcr.io/<owner>/<repo>:slim` for amd64 + arm64 (weekly/on demand). |
 | `.github/workflows/smoke-test.yml` | Pulls the published image and checks stack start, `/api/`, register/login. |
 | `.github/workflows/auto-rebase.yml` | Daily rebase onto `upstream/main`, with backup branch and OpenCode conflict resolution. |
 | `.github/auto-rebase-prompt.md` | Instructions the OpenCode agent follows to resolve rebase conflicts. |
-| `README.md` | Short fork notice at the top (shown on the GitHub landing page). |
+| `README.md` | Full project and installation guide for the fork, with prominent upstream attribution. |
 
 ## Invariants
 
 - `package.json` and `pnpm-lock.yaml` must stay **identical to upstream**.
+- The runtime image needs the Prisma CLI and `source-map-support`, but those are installed
+  into `/opt/runtime-tools` by `Dockerfile.slim` instead of changing the manifests.
 - No Elasticsearch. Temporal uses PostgreSQL visibility, plus `temporal-visibility-init`
   (removes the two default Text search attributes so Postiz's two fit the limit of 3).
 - The worker watchdog is **off** unless `TEMPORAL_WORKER_WATCHDOG=1`.
@@ -69,10 +72,10 @@ rebases and LLM agents.
 ## Conflict rules
 
 - `package.json`, `pnpm-lock.yaml`: always take upstream.
-- `Dockerfile.slim`, `var/docker/**`, `postiz-slim.yaml`: keep ours.
+- `Dockerfile.slim`, `var/docker/**`, `postiz-slim.yaml`, `docker-compose.slim.yaml`: keep ours.
 - `apps/orchestrator/src/main.ts`: keep our watchdog on top of upstream's version.
 - `.github/workflows/staging-conflicts.yml`: keep it deleted.
-- `README.md`: take upstream and re-add the fork notice at the top.
+- `README.md`: keep our fork README and its upstream attribution.
 - Everything else: prefer upstream, unless it breaks the rules above.
 
 ## Reconstructing context

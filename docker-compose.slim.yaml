@@ -1,0 +1,15 @@
+# Build the slim image from this checkout and run the lean self-hosting stack
+# from postiz-slim.yaml (no Elasticsearch):
+#
+#   docker compose -f postiz-slim.yaml -f docker-compose.slim.yaml up -d --build
+#
+# Only the postiz service is overridden; PostgreSQL, Redis and the Temporal
+# stack stay exactly as defined in postiz-slim.yaml.
+services:
+  postiz:
+    image: postiz:slim
+    build:
+      context: .
+      dockerfile: Dockerfile.slim
+      args:
+        NEXT_PUBLIC_VERSION: ${NEXT_PUBLIC_VERSION:-local}
